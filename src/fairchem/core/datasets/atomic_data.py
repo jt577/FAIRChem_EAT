@@ -52,7 +52,7 @@ _REQUIRED_KEYS = [
     "tags",
 ]
 
-_OPTIONAL_KEYS = ["energy", "forces", "stress", "dataset"]
+_OPTIONAL_KEYS = ["energy", "forces", "stress", "dataset", "eat_weights", "enable_eat_grad", "occupancy", "enable_occ_grad",]    # -------------------- EAT MODIFICATION --------------------
 
 # TODO: potential future keys
 # ["virials", "atom_attr", "edge_attr"]
@@ -146,6 +146,8 @@ class AtomicData:
         batch: torch.Tensor | None = None,  # (num_node,)
         sid: list[str] | None = None,
         dataset: list[str] | str | None = None,
+        eat_weights: torch.Tensor | None = None,   # (num_node, max_num_elements (?))               # -------------------- EAT MODIFICATION --------------------
+        enable_eat_grad: bool = False,               # whether to enable eat_grad computation       # -------------------- EAT MODIFICATION --------------------
     ):
         self.__keys__ = set(_REQUIRED_KEYS)
 
@@ -167,7 +169,14 @@ class AtomicData:
 
         if dataset is not None:
             self.dataset = dataset
-
+        
+        # -------------------- BEGIN EAT MODIFICATION --------------------
+        # Assign eat_weights to AtomicData object                 
+        if eat_weights is not None:                                             
+            self.eat_weights = eat_weights    
+        self.enable_eat_grad = enable_eat_grad  
+        # -------------------- END EAT MODIFICATION --------------------                                
+        
         # tagets
         if energy is not None:
             self.energy = energy
@@ -247,6 +256,13 @@ class AtomicData:
             else:
                 assert isinstance(self.dataset, str)
                 assert self.num_graphs == 1
+
+        # make sure eat_weights and occupancy has compatible dims                                               # -------------------- EAT MODIFICATION --------------------
+        if hasattr(self, "eat_weights"):                                                                        # -------------------- EAT MODIFICATION --------------------
+            assert self.eat_weights.shape[0] == self.pos.shape[0], "eat_weights must have one row per atom"     # -------------------- EAT MODIFICATION --------------------       
+            # Usually (num_nodes, max_num_elements) – you know max_num_elements                                 # -------------------- EAT MODIFICATION --------------------
+            assert self.eat_weights.dim() == 2, "eat_weights must be 2D"                                        # -------------------- EAT MODIFICATION --------------------
+            assert self.eat_weights.dtype in (torch.float32, torch.float64)                                     # -------------------- EAT MODIFICATION --------------------
 
         # dtype checks
         assert (
@@ -339,6 +355,38 @@ class AtomicData:
         pbc = torch.from_numpy(pbc).bool().view(1, 3)
         cell = torch.from_numpy(cell).to(target_dtype).view(1, 3, 3)
         natoms = torch.tensor([pos.shape[0]], dtype=torch.long)
+
+
+        # -------------------- BEGIN EAT MODIFICATION --------------------
+        # EAT weights, if present                                                           
+        eat_weights = None                                                                  
+        enable_eat_grad = bool(atoms.info.get("enable_eat_grad", False))                    
+        if "eat_weights" in atoms.arrays:                                                   
+            eat_np = np.array(atoms.arrays["eat_weights"], copy=True)                       
+            # expect shape (natoms, max_num_elements) or (natoms, n_basis)                  
+            eat_weights = torch.tensor(                                                     
+                eat_np,                                                                     
+                dtype=target_dtype,                                                         
+                requires_grad=enable_eat_grad,                                              
+            )   
+        elif "eat_weights_live" in atoms.info:
+            eat_weights = atoms.info["eat_weights_live"]
+            assert torch.is_tensor(eat_weights), \
+                "atoms.info['eat_weights_live'] must be a torch Tensor"
+            # --- sanity checks BEFORE touching it ---
+            if enable_eat_grad:
+                assert eat_weights.requires_grad, "eat_weights_live must already require grad"
+                assert eat_weights.is_leaf, "eat_weights_live must be a leaf"
+                assert eat_weights.grad_fn is None, "eat_weights_live must be a leaf (grad_fn=None)"
+            # --- dtype/device handling WITHOUT breaking graph ---
+            if eat_weights.dtype != target_dtype:
+                raise RuntimeError(
+                    f"eat_weights_live has wrong dtype. Expected {target_dtype}, got {eat_weights.dtype}."
+                )
+            if enable_eat_grad:
+                # This is safe: does nothing if already True
+                eat_weights.requires_grad_(True)
+        # -------------------- END EAT MODIFICATION --------------------
 
         # graph construction
         if r_edges:
@@ -448,6 +496,8 @@ class AtomicData:
             stress=stress,
             sid=[sid] if isinstance(sid, str) else sid,
             dataset=task_name,
+            eat_weights=eat_weights,                                                    # -------------------- EAT MODIFICATION --------------------
+            enable_eat_grad=enable_eat_grad,                                            # -------------------- EAT MODIFICATION --------------------
         )
 
         return data
@@ -487,6 +537,9 @@ class AtomicData:
         if self.sid is not None:
             atoms.info["sid"] = self.sid
 
+        if hasattr(self, "eat_weights"):                                            # -------------------- EAT MODIFICATION --------------------
+            atoms.set_array("eat_weights", self.eat_weights.cpu().numpy())          # -------------------- EAT MODIFICATION --------------------
+        atoms.info["enable_eat_grad"] = self.enable_eat_grad                        # -------------------- EAT MODIFICATION --------------------
         return atoms
 
     def to_ase(self) -> list[ase.Atoms]:
@@ -518,6 +571,8 @@ class AtomicData:
             batch=dictionary.get("batch", None),
             sid=dictionary.get("sid", None),
             dataset=dictionary.get("dataset", None),
+            eat_weights=dictionary.get("eat_weights", None),            # -------------------- EAT MODIFICATION --------------------
+            enable_eat_grad=dictionary.get("enable_eat_grad", False),   # -------------------- EAT MODIFICATION --------------------
         )
 
         # TODO: may require validation for them in the future
@@ -685,14 +740,25 @@ class AtomicData:
         r"""Performs a deep-copy of the data object."""
         data_dict = {}
         for key in self.__keys__:
-            if torch.is_tensor(self[key]):
+            # -------------------- BEGIN EAT MODIFICATION --------------------
+            if key == "eat_weights":
+                data_dict[key] = self[key]   # preserve the exact tensor object
+            elif torch.is_tensor(self[key]):
                 data_dict[key] = self[key].clone()
             else:
-                # TODO: with this we should stop making sid special.
                 data_dict[key] = copy.deepcopy(self[key])
-                # ""
-                # print(key)
-                # raise ValueError("keys must correspond to torch tensors.")
+            # -------------------- END EAT MODIFICATION --------------------
+
+            # --- BEGIN ORIGINAL CODE -----
+            # if torch.is_tensor(self[key]):
+            #     data_dict[key] = self[key].clone()
+            # else:
+            #     # TODO: with this we should stop making sid special.
+            #     data_dict[key] = copy.deepcopy(self[key])
+            #     # ""
+            #     # print(key)
+            #     # raise ValueError("keys must correspond to torch tensors.")
+            # --- END ORIGINAL CODE -----
         data_dict["sid"] = copy.deepcopy(self.sid)
         data_dict["batch"] = self.batch.clone()
         batch_stats = copy.deepcopy(self.get_batch_stats())
@@ -891,7 +957,6 @@ def atomicdata_list_to_batch(
         cat_dim = 0 if cat_dim is None else cat_dim
         if torch.is_tensor(item):
             batched_data_dict[key] = torch.cat(items, cat_dim)
-
         # TODO: this allows non-tensor fields to be batched.
         # we might want to remove support for that.
         else:

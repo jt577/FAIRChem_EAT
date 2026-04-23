@@ -448,7 +448,14 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 graph_dict["node_partition"]
             ]
             data_dict["batch"] = data_dict["batch_full"][graph_dict["node_partition"]]
-
+            # -------------------- BEGIN EAT MODIFICATION --------------------
+            if "eat_weights_full" in data_dict:                                                 
+                data_dict["eat_weights"] = data_dict["eat_weights_full"][                       
+                    graph_dict["node_partition"]                                                
+                ]                                                                               
+            if "occupancy_full" in data_dict:                                                           
+                data_dict["occupancy"] = data_dict["occupancy_full"][graph_dict["node_partition"]]      
+            # -------------------- END EAT MODIFICATION --------------------
         if self.edge_chunk_size is not None:
             pad_edges(graph_dict, self.edge_chunk_size, self.cutoff)
 
@@ -459,7 +466,14 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         data_dict["atomic_numbers"] = data_dict["atomic_numbers"].long()
         data_dict["atomic_numbers_full"] = data_dict["atomic_numbers"]
         data_dict["batch_full"] = data_dict["batch"]
-
+        # -------------------- BEGIN EAT MODIFICATION --------------------
+        if "eat_weights" in data_dict:                                               
+            data_dict["eat_weights_full"] = data_dict["eat_weights"]                 
+            # Define occupancy as sum of EAT weights per atom
+            occ = data_dict["eat_weights_full"].sum(dim=1)  # (N,)
+            data_dict["occupancy"] = occ.to(data_dict["pos"].dtype) 
+            data_dict["occupancy_full"] = data_dict["occupancy"]            
+        # -------------------- END EAT MODIFICATION --------------------
         csd_mixed_emb = self.csd_embedding(
             charge=data_dict["charge"],
             spin=data_dict["spin"],
@@ -470,6 +484,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             atomic_numbers_full=data_dict["atomic_numbers_full"],
             batch_full=data_dict["batch_full"],
             csd_mixed_emb=csd_mixed_emb,
+            eat_weights_full=data_dict.get("eat_weights_full", None),               # -------------------- EAT MODIFICATION --------------------
         )
 
         with record_function("get_displacement_and_cell"):
@@ -477,6 +492,8 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
 
         with record_function("generate_graph"):
             graph_dict = self._generate_graph(data_dict)
+        
+        occ_full, edge_gate = self._get_occupancy_tensors(data_dict, graph_dict)         # -------------------- EAT MODIFICATION --------------------
 
         if graph_dict["edge_index"].numel() == 0:
             raise ValueError(
@@ -503,9 +520,12 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 device=data_dict["pos"].device,
                 dtype=data_dict["pos"].dtype,
             )
-            x_message[:, 0, :] = self.sphere_embedding(data_dict["atomic_numbers"])
+            # x_message[:, 0, :] = self.sphere_embedding(data_dict["atomic_numbers"])              # -------------------- ORIGINAL CODE --------------------
+            x_message[:, 0, :] = self._get_node_sphere_embedding(data_dict)                        # -------------------- EAT MODIFICATION --------------------
 
         sys_node_embedding = csd_mixed_emb[data_dict["batch"]]
+        # if occ_full is not None:                                                                     # -------------------- EAT MODIFICATION --------------------
+        #     sys_node_embedding = sys_node_embedding * occ_full.reshape(-1, 1)                        # -------------------- EAT MODIFICATION --------------------
         x_message[:, 0, :] = x_message[:, 0, :] + sys_node_embedding
 
         ###
@@ -522,15 +542,28 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         with record_function("edge embedding"):
             dist_scaled = graph_dict["edge_distance"] / self.cutoff
             edge_envelope = self.envelope(dist_scaled).reshape(-1, 1, 1)
+            # -------------------- BEGIN EAT MODIFICATION --------------------
+            if edge_gate is not None:
+                edge_envelope = edge_envelope * edge_gate.to(edge_envelope.dtype).view(-1,1,1)
+            # -------------------- END EAT MODIFICATION --------------------
             edge_distance_embedding = self.distance_expansion(
                 graph_dict["edge_distance"]
             )
-            source_embedding = self.source_embedding(
-                data_dict["atomic_numbers_full"][graph_dict["edge_index"][0]]
-            )
-            target_embedding = self.target_embedding(
-                data_dict["atomic_numbers_full"][graph_dict["edge_index"][1]]
-            )
+            # # -------------------- BEGIN ORIGINAL CODE --------------------
+            # source_embedding = self.source_embedding(                                 
+            #     data_dict["atomic_numbers_full"][graph_dict["edge_index"][0]]         
+            # )                                                                         
+            # target_embedding = self.target_embedding(                                 
+            #     data_dict["atomic_numbers_full"][graph_dict["edge_index"][1]]         
+            # )                                                                         
+            # # -------------------- END ORIGINAL CODE --------------------
+
+            # -------------------- BEGIN EAT MODIFICATION --------------------
+            source_embedding, target_embedding = self._get_edge_endpoint_embeddings(    
+                data_dict, graph_dict                                                   
+            )                                               
+            # -------------------- END EAT MODIFICATION --------------------
+
             x_edge = torch.cat(
                 (edge_distance_embedding, source_embedding, target_embedding), dim=1
             )
@@ -635,6 +668,74 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                     no_wd_list.append(global_parameter_name)
 
         return set(no_wd_list)
+    
+    # -------------------- BEGIN EAT MODIFICATION --------------------
+    def _get_node_sphere_embedding(self, data_dict):                                        
+        """                                                                                 
+        Returns per-node scalar embedding of shape (num_nodes, sphere_channels).            
+        If `eat_weights` is present, uses it to make a linear combination of                
+        element embeddings. Otherwise falls back to standard atomic_numbers lookup.         
+        """                                                                                 
+        if "eat_weights" in data_dict:                                                  
+            weights = data_dict["eat_weights"]  # (num_nodes, n_elems)  
+            elem_emb = self.sphere_embedding.weight  # (max_num_elements, sphere_channels)  
+            # sanity checks                                                                 
+            assert weights.dim() == 2                                                       
+            assert weights.shape[1] == elem_emb.shape[0], (                                 
+                f"eat_weights second dim {weights.shape[1]} "                               
+                f"!= sphere_embedding size {elem_emb.shape[0]}"                             
+            )                                                                               
+            # match dtype just in case                                                      
+            weights = weights.to(elem_emb.dtype)                                            
+            # (num_nodes, sphere_channels)                                                  
+            return weights @ elem_emb                                                       
+        else:                                                                               
+            return self.sphere_embedding(data_dict["atomic_numbers"])                       
+
+    def _get_edge_endpoint_embeddings(self, data_dict, graph_dict):                                             
+        """                                                                                 
+        Returns source_embedding, target_embedding for edges.                               
+        Uses EAT weights if present, else falls back to integer embeddings.                 
+        """                                                                                 
+        if "eat_weights_full" in data_dict:                                                 
+            weights_full = data_dict["eat_weights_full"]  # (N, Z)                          
+            src_w = weights_full[graph_dict["edge_index"][0]]  # (E, Z)                     
+            tgt_w = weights_full[graph_dict["edge_index"][1]]  # (E, Z)                     
+            assert weights_full.shape[1] == self.source_embedding.weight.shape[0]           
+            src_emb = src_w @ self.source_embedding.weight   # (E, edge_channels)           
+            tgt_emb = tgt_w @ self.target_embedding.weight   # (E, edge_channels)           
+            return src_emb, tgt_emb                                                         
+        else:                                                                               
+            src_emb = self.source_embedding(                                                
+                data_dict["atomic_numbers_full"][graph_dict["edge_index"][0]]               
+            )                                                                               
+            tgt_emb = self.target_embedding(                                                
+                data_dict["atomic_numbers_full"][graph_dict["edge_index"][1]]               
+            )                                                                               
+            return src_emb, tgt_emb                             
+
+    def _get_occupancy_tensors(self, data_dict, graph_dict):
+        # If occupancy_full isn't provided, derive it from eat_weights_full if possible
+        if "occupancy_full" not in data_dict:
+            if "eat_weights_full" not in data_dict:
+                return None, None
+            data_dict["occupancy_full"] = data_dict["eat_weights_full"].sum(dim=1).to(data_dict["pos"].dtype)
+
+            # also ensure partitioned occupancy exists (for heads / node gating)
+            if "occupancy" not in data_dict:
+                if "node_partition" in graph_dict:
+                    data_dict["occupancy"] = data_dict["occupancy_full"][graph_dict["node_partition"]]
+                else:
+                    data_dict["occupancy"] = data_dict["occupancy_full"]
+
+        occ_full = data_dict["occupancy_full"].to(data_dict["pos"].dtype)
+
+        src = graph_dict["edge_index"][0]
+        dst = graph_dict["edge_index"][1]
+        edge_gate = occ_full[src] * occ_full[dst]
+        return occ_full, edge_gate
+
+    # -------------------- END EAT MODIFICATION --------------------
 
 
 class MLP_EFS_Head(nn.Module, HeadInterface):
@@ -687,6 +788,14 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
         _input = emb["node_embedding"].narrow(1, 0, 1).squeeze(1)
         _output = self.energy_block(_input)
         node_energy = _output.view(-1, 1, 1)
+
+        # --------------------- BEGIN EAT MODIFICATION --------------------
+        # occupancy gate
+        if "occupancy" in data:
+            occ = data["occupancy"].to(node_energy.dtype).view(-1, 1, 1)
+            node_energy = node_energy * occ
+        # --------------------- END EAT MODIFICATION --------------------
+
         energy_part = torch.zeros(
             len(data["natoms"]), device=data["pos"].device, dtype=node_energy.dtype
         )
@@ -704,13 +813,46 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
             outputs["embeddings"] = (
                 {"embeddings": embeddings} if self.wrap_property else embeddings
             )
+        
+        # ---------------------- BEGIN EAT MODIFICATION --------------------
+        # Normalize enable_eat_grad to a plain bool                                     
+        flag = getattr(data, "enable_eat_grad", False)                                  
+        if isinstance(flag, (list, tuple)):                                             
+            flag = any(flag)                                                            
+        elif torch.is_tensor(flag):                                                     
+            assert flag.numel() == 1, "enable_eat_grad tensor must be scalar"           
+            flag = bool(flag.item())                                                    
+        else:                                                                           
+            flag = bool(flag)  
+        # Get forces so we can take EAT gradient of them when doing phonon calculations, even when forces are not regressed
+        if flag:    
+            forces = (                                                                                                                    
+                -1                                                                                                                      
+                * torch.autograd.grad(                                                                                                  
+                    energy_part.sum(), data["pos"], create_graph=True, retain_graph=True,   # create and retain graph for EAT grad calc   
+                )[0]                                                                                                                    
+            )         
+            if gp_utils.initialized():
+                forces = gp_utils.reduce_from_model_parallel_region(forces)
+            outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
+        # ---------------------- END EAT MODIFICATION --------------------                                                      
 
         if self.regress_stress:
-            grads = torch.autograd.grad(
-                [energy_part.sum()],
-                [data["pos_original"], emb["displacement"]],
-                create_graph=self.training,
-            )
+            # --------------------- BEGIN EAT MODIFICATION --------------------
+            if flag:                                                                    
+                grads = torch.autograd.grad(                                            
+                    [energy_part.sum()],                                                
+                    [data["pos_original"], emb["displacement"]],                        
+                    create_graph=self.training,                                         
+                    retain_graph=True,          # retain graph for EAT grad calc        
+                )
+            # --------------------- END EAT MODIFICATION --------------------                                                                       
+            else:
+                grads = torch.autograd.grad(
+                    [energy_part.sum()],
+                    [data["pos_original"], emb["displacement"]],
+                    create_graph=self.training,
+                )
             if gp_utils.initialized():
                 grads = (
                     gp_utils.reduce_from_model_parallel_region(grads[0]),
@@ -725,16 +867,30 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
             stress = stress.view(
                 -1, 9
             )  # NOTE to work better with current Multi-task trainer
-            outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
+            # ------------------- BEGIN EAT MODIFICATION --------------------
+            if not flag:
+                outputs[forces_key] = {"forces": forces} if self.wrap_property else forces # Only set forces if not already set above
+            # ------------------- END EAT MODIFICATION --------------------
+            # outputs[forces_key] = {"forces": forces} if self.wrap_property else forces # original code
             outputs[stress_key] = {"stress": stress} if self.wrap_property else stress
             data["cell"] = emb["orig_cell"]
         elif self.regress_forces:
-            forces = (
-                -1
-                * torch.autograd.grad(
-                    energy_part.sum(), data["pos"], create_graph=self.training
-                )[0]
-            )
+            # -------------------- BEGIN EAT MODIFICATION --------------------
+            if flag:    
+                forces = (                                                                                                                    
+                    -1                                                                                                                      
+                    * torch.autograd.grad(                                                                                                  
+                        energy_part.sum(), data["pos"], create_graph=self.training, retain_graph=True,   # create and retain graph for EAT grad calc   
+                    )[0]                                                                                                                    
+                )                                                                                                                           
+            # -------------------- END EAT MODIFICATION --------------------
+            else:
+                forces = (
+                    -1
+                    * torch.autograd.grad(
+                        energy_part.sum(), data["pos"], create_graph=self.training,
+                    )[0]
+                )
             if gp_utils.initialized():
                 forces = gp_utils.reduce_from_model_parallel_region(forces)
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
@@ -763,6 +919,27 @@ class MLP_Energy_Head(nn.Module, HeadInterface):
             emb["node_embedding"].narrow(1, 0, 1).squeeze(1)
         ).view(-1, 1, 1)
 
+        # ----------------------- BEGIN EAT MODIFICATION --------------------
+        if "occupancy" in data_dict:
+            occ = data_dict["occupancy"].to(node_energy.dtype).view(-1, 1, 1)
+            node_energy = node_energy * occ
+            # Effective natoms under occupancy (per system)
+            occ = data_dict["occupancy"].to(node_energy.dtype).view(-1)  # (N,)
+            occ_sum = torch.zeros(
+                len(data_dict["natoms"]),
+                device=node_energy.device,
+                dtype=node_energy.dtype,
+            ).index_add_(0, data_dict["batch"], occ)
+
+            if gp_utils.initialized():
+                occ_sum = gp_utils.reduce_from_model_parallel_region(occ_sum)
+
+            occ_sum = occ_sum.clamp_min(1e-12)
+        else:
+            occ_sum = data_dict["natoms"].to(node_energy.dtype)
+
+        # ----------------------- END EAT MODIFICATION --------------------
+
         energy_part = torch.zeros(
             len(data_dict["natoms"]),
             device=node_energy.device,
@@ -778,7 +955,8 @@ class MLP_Energy_Head(nn.Module, HeadInterface):
         if self.reduce == "sum":
             return {"energy": energy}
         elif self.reduce == "mean":
-            return {"energy": energy / data_dict["natoms"]}
+            # return {"energy": energy / data_dict["natoms"]} # ----------------------- ORIGINAL CODE --------------------
+            return {"energy": energy / occ_sum}
         else:
             raise ValueError(
                 f"reduce can only be sum or mean, user provided: {self.reduce}"
@@ -798,6 +976,26 @@ class Linear_Energy_Head(nn.Module, HeadInterface):
             emb["node_embedding"].narrow(1, 0, 1).squeeze(1)
         ).view(-1, 1, 1)
 
+        # ----------------------- BEGIN EAT MODIFICATION --------------------
+        if "occupancy" in data_dict:
+            occ = data_dict["occupancy"].to(node_energy.dtype).view(-1, 1, 1)
+            node_energy = node_energy * occ
+            # Effective natoms under occupancy (per system)
+            occ = data_dict["occupancy"].to(node_energy.dtype).view(-1)  # (N,)
+            occ_sum = torch.zeros(
+                len(data_dict["natoms"]),
+                device=node_energy.device,
+                dtype=node_energy.dtype,
+            ).index_add_(0, data_dict["batch"], occ)
+
+            if gp_utils.initialized():
+                occ_sum = gp_utils.reduce_from_model_parallel_region(occ_sum)
+
+            occ_sum = occ_sum.clamp_min(1e-12)
+        else:
+            occ_sum = data_dict["natoms"].to(node_energy.dtype)
+        # ----------------------- END EAT MODIFICATION --------------------
+
         energy_part = torch.zeros(
             len(data_dict["natoms"]),
             device=node_energy.device,
@@ -814,7 +1012,8 @@ class Linear_Energy_Head(nn.Module, HeadInterface):
         if self.reduce == "sum":
             return {"energy": energy}
         elif self.reduce == "mean":
-            return {"energy": energy / data_dict["natoms"]}
+            # return {"energy": energy / data_dict["natoms"]} # ----------------------- ORIGINAL CODE --------------------
+            return {"energy": energy / occ_sum}
         else:
             raise ValueError(
                 f"reduce can only be sum or mean, user provided: {self.reduce}"

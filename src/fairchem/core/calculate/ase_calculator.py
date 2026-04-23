@@ -13,6 +13,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
+import torch                                                                    # -------------------- EAT MODIFICATION --------------------
 from ase.calculators.calculator import Calculator
 from ase.stress import full_3x3_to_voigt_6_stress
 
@@ -204,14 +205,69 @@ class FAIRChemCalculator(Calculator):
             # Convert using the current a2g object
             data_object = self.a2g(atoms)
 
+            # -------------------- BEGIN EAT MODIFICATION --------------------
+            # Normalize EAT and occupancy grad flag for this system                             
+            enable_eat_grad = getattr(data_object, "enable_eat_grad", False) 
+            if isinstance(enable_eat_grad, (list, tuple)):                                      
+                enable_eat_grad = any(enable_eat_grad)                                          
+            elif torch.is_tensor(enable_eat_grad):                                              
+                assert enable_eat_grad.numel() == 1, "enable_eat_grad tensor must be scalar"    
+                enable_eat_grad = bool(enable_eat_grad.item())                                  
+            else:                                                                               
+                enable_eat_grad = bool(enable_eat_grad)                                         
+            # -------------------- END EAT MODIFICATION --------------------
+            
             # Batch and predict
             batch = data_list_collater([data_object], otf_graph=True)
+
+            # -------------------- BEGIN EAT MODIFICATION --------------------
+            # ---- helper to grab tensors from AtomicData / dict-like ----
+            def _get(batch_obj, key):
+                if hasattr(batch_obj, key):
+                    return getattr(batch_obj, key)
+                try:
+                    return batch_obj[key]
+                except Exception:
+                    return None
+            # -------------------- END EAT MODIFICATION --------------------
+
             pred = self.predictor.predict(batch)
+
+            # -------------------- BEGIN EAT MODIFICATION --------------------
+            eat_w = getattr(getattr(self.predictor, "_last_data_device", None), "eat_weights", None)
+            if enable_eat_grad and eat_w is None:
+                raise RuntimeError("enable_eat_grad=True but predictor._last_data_device.eat_weights is missing")
+            # -------------------- END EAT MODIFICATION --------------------
 
             # Collect the results into self.results
             self.results = {}
+            # ------------------------ BEGIN EAT MODIFICATION --------------------
+            # ---- stash torch handles for higher-order tests (do NOT detach) ----
+            if enable_eat_grad:
+                if "forces" in pred:
+                    self.results["_forces_torch"] = pred["forces"]   # (N,3) torch, should have grad_fn
+                if "energy" in pred:
+                    self.results["_energy_torch"] = pred["energy"]   # (B,) torch
+                self.results["_eat_weights_torch"] = eat_w           # (N,Z) torch leaf-ish
+            # ------------------------ END EAT MODIFICATION --------------------
             for calc_key in self.implemented_properties:
                 if calc_key == "energy":
+                    # -------------------- BEGIN EAT MODIFICATION --------------------
+                    E_tensor = pred[calc_key]
+                    if enable_eat_grad:
+                        g = torch.autograd.grad(
+                            E_tensor.sum(),
+                            eat_w,
+                            retain_graph=True,
+                            create_graph=False,
+                            allow_unused=True,
+                        )[0]
+                        if g is None:
+                            # if model path somehow doesn't touch eat_w, avoid crashing
+                            g = torch.zeros_like(eat_w)
+                        self.results["eat_grad"] = g.detach().cpu().numpy()
+                    # -------------------- END EAT MODIFICATION --------------------
+
                     energy = float(pred[calc_key].detach().cpu().numpy()[0])
 
                     self.results["energy"] = self.results["free_energy"] = (

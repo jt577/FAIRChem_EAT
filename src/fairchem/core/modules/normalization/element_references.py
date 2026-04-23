@@ -38,14 +38,44 @@ class ElementReferences(nn.Module):
     def compute_references(batch, tensor, elem_refs, operation):
         assert tensor.shape[0] == len(batch.natoms)
         with torch.autocast(elem_refs.device.type, enabled=False):
-            refs = torch.zeros(
-                tensor.shape, dtype=elem_refs.dtype, device=tensor.device
-            ).scatter_reduce(
-                0,
-                batch.batch_full,
-                elem_refs[batch.atomic_numbers_full],
-                reduce="sum",
-            )
+            # -------------------- BEGIN EAT MODIFICATION --------------------
+            if hasattr(batch, "eat_weights_full"):                                      
+                # EAT: elem_refs is per-element; compute per-atom refs                  
+                # batch.eat_weights_full: (N, Z)                                        
+                weights = batch.eat_weights_full.to(elem_refs.device)                   
+                # elem_refs: shape compatible with Z, e.g. (Z,) or (Z, D, ...)          
+                # simplest 1D case:                                                     
+                per_atom_refs = (weights * elem_refs.unsqueeze(0)).sum(dim=1)           
+                refs = torch.zeros(                                                     
+                    tensor.shape, dtype=elem_refs.dtype, device=tensor.device          
+                ).scatter_reduce(                                                      
+                    0,                                                                 
+                    batch.batch_full,                                                  
+                    per_atom_refs,                                                     
+                    reduce="sum",                                                      
+                )   
+            else:
+                per_atom_refs = elem_refs[batch.atomic_numbers_full]  # (N,)
+                refs = torch.zeros(
+                    tensor.shape, dtype=elem_refs.dtype, device=tensor.device
+                ).scatter_reduce(
+                    0,
+                    batch.batch_full,
+                    per_atom_refs,
+                    reduce="sum",
+                )
+            # -------------------- END EAT MODIFICATION --------------------
+
+            # # ORIGINAL CODE
+            # refs = torch.zeros(
+            #         tensor.shape, dtype=elem_refs.dtype, device=tensor.device
+            #     ).scatter_reduce(
+            #         0,
+            #         batch.batch_full,
+            #         elem_refs[batch.atomic_numbers_full],
+            #         reduce="sum",
+            # )
+
             if operation == "subtract":
                 return tensor - refs
             elif operation == "add":

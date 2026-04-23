@@ -253,6 +253,24 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         # this needs to be .clone() to avoid issues with graph parallel modifying this data with MOLE
         data_device = data.to(self.device).clone()
 
+        # ------------------- BEGIN EAT MODIFICATION -------------------
+        self._last_data_device = data_device
+        # ---- EAT grad flag helper ----
+        flag = getattr(data_device, "enable_eat_grad", False)
+        if isinstance(flag, (list, tuple)):
+            flag = any(flag)
+        elif torch.is_tensor(flag):
+            flag = bool(flag.item())
+        else:
+            flag = bool(flag)
+
+        # If we're doing EAT grads, we must NOT run in no_grad and we must ensure the
+        # *device-side* eat_weights are the ones requiring grad.
+        if flag and hasattr(data_device, "eat_weights") and data_device.eat_weights is not None:
+            # Make the tensor used by the model a leaf that requires grad
+            data_device.eat_weights = data_device.eat_weights.requires_grad_(True)
+        # ------------------- END EAT MODIFICATION -------------------
+
         if self.inference_mode.merge_mole:
             if self.merged_on is None:
                 # only get embeddings after moved to final device to get right types
@@ -282,7 +300,14 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
                     self.merged_on[1] == this_sys[1]
                 ), f"Cannot run on merged model on system. Dataset is different {self.merged_on[1]} vs {this_sys[1]}"
 
-        inference_context = torch.no_grad() if self.direct_forces else nullcontext()
+        # -------------------- BEGIN EAT MODIFICATION -------------------
+        if flag:
+            inference_context = nullcontext()  # keep grads ON
+        else:
+            inference_context = torch.no_grad() if self.direct_forces else nullcontext()
+        # -------------------- END EAT MODIFICATION -------------------
+
+        # inference_context = torch.no_grad() if self.direct_forces else nullcontext() # original code
         tf32_context = (
             tf32_context_manager() if self.inference_mode.tf32 else nullcontext()
         )

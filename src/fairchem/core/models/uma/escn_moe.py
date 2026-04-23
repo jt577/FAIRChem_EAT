@@ -90,6 +90,7 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
             atomic_numbers_full=data["atomic_numbers"],
             batch_full=data["batch"],
             csd_mixed_emb=csd_mixed_emb,
+            eat_weights_full=data.get("eat_weights_full", None),  # -------------------- EAT MODIFICATION --------------------
         )
         if self.mole_type != "so2":
             raise ValueError("Only mole_type=so2 supported for merging")
@@ -109,23 +110,68 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
         new_model.eval()
         return new_model
 
-    def set_MOLE_coefficients(self, atomic_numbers_full, batch_full, csd_mixed_emb):
+    def set_MOLE_coefficients(
+        self,
+        atomic_numbers_full,
+        batch_full,
+        csd_mixed_emb,
+        eat_weights_full=None,                                                                  # -------------------- EAT MODIFICATION --------------------
+    ):
         if self.num_experts == 0:
             return
         with torch.autocast(device_type=atomic_numbers_full.device.type, enabled=False):
             embeddings = []
             if self.use_composition_embedding:
-                composition_by_atom = self.composition_embedding(atomic_numbers_full)
-                composition = composition_by_atom.new_zeros(
-                    csd_mixed_emb.shape[0],
-                    self.sphere_channels,
-                ).index_reduce_(
-                    0,
-                    batch_full,
-                    composition_by_atom,
-                    reduce="mean",
-                    include_self=np.isclose(self.model_version, 1.0).item(),
-                )
+                # -------------------- BEGIN EAT MODIFICATION --------------------
+                if eat_weights_full is not None:                                                
+                    W = self.composition_embedding.weight  # (Z, C)
+
+                    occ_full = eat_weights_full.sum(dim=1, keepdim=True)          # (N,1)
+                    comp_full = eat_weights_full / occ_full.clamp_min(1e-8)       # (N,Z)
+
+                    composition_by_atom = comp_full.to(W.dtype) @ W               # (N,C)
+                    weights = occ_full.to(composition_by_atom.dtype)              # (N,1)
+
+                    composition = composition_by_atom.new_zeros(csd_mixed_emb.size(0), self.sphere_channels)
+                    composition.index_add_(0, batch_full, composition_by_atom * weights)
+
+                    occ_sum = composition_by_atom.new_zeros(csd_mixed_emb.size(0), 1)
+                    occ_sum.index_add_(0, batch_full, weights)
+
+                    if np.isclose(self.model_version, 1.0).item():
+                        occ_sum = occ_sum + 1.0   # <- include_self analogue
+
+                    composition = composition / occ_sum.clamp_min(1e-8)
+
+                # ------------------- END EAT MODIFICATION --------------------
+                else:
+                    # Original path: composition from integer atomic_numbers
+                    composition_by_atom = self.composition_embedding(atomic_numbers_full)
+                    # fallback: original mean
+                    composition = composition_by_atom.new_zeros(
+                        csd_mixed_emb.shape[0],
+                        self.sphere_channels,
+                    ).index_reduce_(
+                        0,
+                        batch_full,
+                        composition_by_atom,
+                        reduce="mean",
+                        include_self=np.isclose(self.model_version, 1.0).item(),
+                    )
+
+                # # -------------------- BEGIN ORIGINAL CODE --------------------
+                # composition = composition_by_atom.new_zeros(
+                #     csd_mixed_emb.shape[0],
+                #     self.sphere_channels,
+                # ).index_reduce_(
+                #     0,
+                #     batch_full,
+                #     composition_by_atom,
+                #     reduce="mean",
+                #     include_self=np.isclose(self.model_version, 1.0).item(),
+                # )
+                # # -------------------- END ORIGINAL CODE --------------------
+
                 embeddings.append(composition.unsqueeze(0))
             embeddings.append(csd_mixed_emb[None])
 
